@@ -72,6 +72,7 @@ class SequenceTagger(flair.nn.Model):
             embeddings: TokenEmbeddings,
             tag_dictionary: Dictionary,
             tag_type: str,
+            linear_embeddings: TokenEmbeddings = None,
             use_crf: bool = True,
             use_rnn: bool = True,
             rnn_layers: int = 1,
@@ -91,6 +92,7 @@ class SequenceTagger(flair.nn.Model):
         :param embeddings: word embeddings used in tagger
         :param tag_dictionary: dictionary of tags you want to predict
         :param tag_type: string identifier for tag type
+        :param linear_embeddings: word embeddings used only on linear layer
         :param use_crf: if True use CRF decoder, else project directly to tag space
         :param use_rnn: if True use RNN layer, otherwise use word embeddings directly
         :param rnn_layers: number of RNN layers
@@ -115,6 +117,8 @@ class SequenceTagger(flair.nn.Model):
         self.trained_epochs: int = 0
 
         self.embeddings = embeddings
+
+        self.linear_embeddings = linear_embeddings
 
         # set the dictionaries
         self.tag_dictionary: Dictionary = tag_dictionary
@@ -175,6 +179,8 @@ class SequenceTagger(flair.nn.Model):
         self.bidirectional = True
         self.rnn_type = rnn_type
 
+        linear_embeddings_dim = linear_embeddings.embedding_length if linear_embeddings else 0
+
         # bidirectional LSTM on top of embedding layer
         if self.use_rnn:
             num_directions = 2 if self.bidirectional else 1
@@ -209,11 +215,11 @@ class SequenceTagger(flair.nn.Model):
 
             # final linear map to tag space
             self.linear = torch.nn.Linear(
-                hidden_size * num_directions, len(tag_dictionary)
+                hidden_size * num_directions + linear_embeddings_dim, len(tag_dictionary)
             )
         else:
             self.linear = torch.nn.Linear(
-                self.embeddings.embedding_length, len(tag_dictionary)
+                self.embeddings.embedding_length + linear_embeddings_dim, len(tag_dictionary)
             )
 
         if self.use_crf:
@@ -239,6 +245,7 @@ class SequenceTagger(flair.nn.Model):
             "train_initial_hidden_state": self.train_initial_hidden_state,
             "tag_dictionary": self.tag_dictionary,
             "tag_type": self.tag_type,
+            "linear_embeddings": self.linear_embeddings,
             "use_crf": self.use_crf,
             "use_rnn": self.use_rnn,
             "rnn_layers": self.rnn_layers,
@@ -281,6 +288,7 @@ class SequenceTagger(flair.nn.Model):
             embeddings=state["embeddings"],
             tag_dictionary=state["tag_dictionary"],
             tag_type=state["tag_type"],
+            linear_embeddings=state["linear_embeddings"],
             use_crf=state["use_crf"],
             use_rnn=state["use_rnn"],
             rnn_layers=state["rnn_layers"],
@@ -606,8 +614,8 @@ class SequenceTagger(flair.nn.Model):
     def forward(self, sentences: List[Sentence]):
 
         self.embeddings.embed(sentences)
-
-        names = self.embeddings.get_names()
+        if self.linear_embeddings:
+            self.linear_embeddings.embed(sentences)
 
         lengths: List[int] = [len(sentence.tokens) for sentence in sentences]
         longest_token_sequence_in_batch: int = max(lengths)
@@ -618,26 +626,46 @@ class SequenceTagger(flair.nn.Model):
             device=flair.device,
         )
 
-        all_embs = list()
+        rnn_embs = list()
+        linear_embs = list()
         for sentence in sentences:
-            all_embs += [
-                emb for token in sentence for emb in token.get_each_embedding(names)
-            ]
             nb_padding_tokens = longest_token_sequence_in_batch - len(sentence)
+
+            rnn_embs += [
+                emb for token in sentence for emb in token.get_each_embedding(self.embeddings.get_names())
+            ]
 
             if nb_padding_tokens > 0:
                 t = pre_allocated_zero_tensor[
                     : self.embeddings.embedding_length * nb_padding_tokens
                     ]
-                all_embs.append(t)
+                rnn_embs.append(t)
 
-        sentence_tensor = torch.cat(all_embs).view(
+            if self.linear_embeddings:
+                linear_embs += [
+                    emb for token in sentence for emb in token.get_each_embedding(self.linear_embeddings.get_names())
+                ]
+                if nb_padding_tokens > 0:
+                    t = pre_allocated_zero_tensor[
+                        : self.linear_embeddings.embedding_length * nb_padding_tokens
+                        ]
+                    linear_embs.append(t)
+
+        sentence_tensor = torch.cat(rnn_embs).view(
             [
                 len(sentences),
                 longest_token_sequence_in_batch,
                 self.embeddings.embedding_length,
             ]
         )
+
+        linear_embs_tensor = torch.cat(linear_embs).view(
+            [
+                len(sentences),
+                longest_token_sequence_in_batch,
+                self.linear_embeddings.embedding_length,
+            ]
+        ) if self.linear_embeddings else torch.empty(len(sentences), longest_token_sequence_in_batch, 0)
 
         # --------------------------------------------------------------------
         # FF PART
@@ -679,6 +707,7 @@ class SequenceTagger(flair.nn.Model):
             if self.use_locked_dropout > 0.0:
                 sentence_tensor = self.locked_dropout(sentence_tensor)
 
+        sentence_tensor = torch.cat([sentence_tensor, linear_embs_tensor], dim=2)
         features = self.linear(sentence_tensor)
 
         return features
